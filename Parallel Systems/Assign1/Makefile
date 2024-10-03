@@ -1,4 +1,4 @@
-CC = g++ 
+CC = g++ -g -Wall
 SRCS = ./src/*.cpp
 INC = ./src/
 OPTS = -std=c++17 -Wall -Werror -lpthread -O3
