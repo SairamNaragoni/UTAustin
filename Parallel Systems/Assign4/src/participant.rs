@@ -23,6 +23,10 @@ use message::ProtocolMessage;
 use message::RequestStatus;
 use oplog;
 
+use crate::participant;
+
+const PARTICIPANT_EXIT_TIMEOUT: Duration = Duration::from_millis(100);
+
 ///
 /// ParticipantState
 /// enum for Participant 2PC state machine
@@ -48,6 +52,11 @@ pub struct Participant {
     running: Arc<AtomicBool>,
     send_success_prob: f64,
     operation_success_prob: f64,
+    tx: Sender<ProtocolMessage>,
+    rx: Receiver<ProtocolMessage>,
+    successful_ops: usize,
+    failed_ops: usize,
+    unknown_ops: usize,
 }
 
 ///
@@ -77,7 +86,9 @@ impl Participant {
         log_path: String,
         r: Arc<AtomicBool>,
         send_success_prob: f64,
-        operation_success_prob: f64) -> Participant {
+        operation_success_prob: f64,
+        tx: Sender<ProtocolMessage>,
+        rx: Receiver<ProtocolMessage>) -> Participant {
 
         Participant {
             id_str: id_str,
@@ -86,7 +97,11 @@ impl Participant {
             running: r,
             send_success_prob: send_success_prob,
             operation_success_prob: operation_success_prob,
-            // TODO
+            tx: tx,
+            rx: rx,
+            successful_ops: 0,
+            failed_ops: 0,
+            unknown_ops: 0
         }
     }
 
@@ -98,12 +113,19 @@ impl Participant {
     ///
     /// HINT: You will need to implement the actual sending
     ///
-    pub fn send(&mut self, pm: ProtocolMessage) {
+    pub fn send(&mut self, pm: ProtocolMessage) -> bool {
         let x: f64 = random();
         if x <= self.send_success_prob {
-            // TODO: Send success
+            if let Err(e) = self.tx.send(pm.clone()) {
+                warn!("participant::send -> {}::failed to send message: {:?}", self.id_str.clone(), e);
+                false
+            } else {
+                debug!("participant::send -> {}::successfully sent message: {:?}", self.id_str.clone(), pm);
+                true
+            }
         } else {
-            // TODO: Send fail
+            warn!("participant::send -> {}::failed to send message due to probability failure", self.id_str.clone());
+            false
         }
     }
 
@@ -119,17 +141,29 @@ impl Participant {
     ///       (it's ok to add parameters or return something other than
     ///       bool if it's more convenient for your design).
     ///
-    pub fn perform_operation(&mut self, request_option: &Option<ProtocolMessage>) -> bool {
+    pub fn perform_operation(&mut self, request: &ProtocolMessage) -> bool {
+        trace!("participant::perform_operation -> {}::Performing operation", self.id_str.clone());
 
-        trace!("{}::Performing operation", self.id_str.clone());
+        let participant_state;
+        
         let x: f64 = random();
         if x <= self.operation_success_prob {
-            // TODO: Successful operation
+            participant_state = MessageType::ParticipantVoteCommit;
         } else {
-            // TODO: Failed operation
+            participant_state = MessageType::ParticipantVoteAbort;
         }
 
-        true
+        let participant_result = ProtocolMessage::generate(
+            participant_state, 
+            request.txid.clone(), 
+            self.id_str.clone(), 
+            request.opid
+        );
+
+        self.log.append_message(participant_result.clone());
+        let send_status = self.send(participant_result.clone());
+        info!("participant::perform_operation -> send_status={}, vote_status={:?}, txid={}", send_status, participant_state, request.txid.clone());
+        send_status
     }
 
     ///
@@ -138,12 +172,8 @@ impl Participant {
     /// requests made by this coordinator before exiting.
     ///
     pub fn report_status(&mut self) {
-        // TODO: Collect actual stats
-        let successful_ops: u64 = 0;
-        let failed_ops: u64 = 0;
-        let unknown_ops: u64 = 0;
-
-        println!("{:16}:\tCommitted: {:6}\tAborted: {:6}\tUnknown: {:6}", self.id_str.clone(), successful_ops, failed_ops, unknown_ops);
+        println!("{:16}:\tCommitted: {:6}\tAborted: {:6}\tUnknown: {:6}", self.id_str.clone(), 
+        self.successful_ops, self.failed_ops, self.unknown_ops);
     }
 
     ///
@@ -153,7 +183,9 @@ impl Participant {
     pub fn wait_for_exit_signal(&mut self) {
         trace!("{}::Waiting for exit signal", self.id_str.clone());
 
-        // TODO
+        while self.running.load(Ordering::SeqCst) {
+            thread::sleep(PARTICIPANT_EXIT_TIMEOUT);
+        }
 
         trace!("{}::Exiting", self.id_str.clone());
     }
@@ -167,7 +199,37 @@ impl Participant {
     pub fn protocol(&mut self) {
         trace!("{}::Beginning protocol", self.id_str.clone());
 
-        // TODO
+        loop {
+            let request = self.rx.recv().unwrap();
+
+            match request.mtype {
+                MessageType::CoordinatorPropose => {
+                    debug!("participant::protocol -> {}::Received CoordinatorPropose from Coordinator #{}", self.id_str.clone(), request.txid);
+                    self.unknown_ops += 1;
+                    self.perform_operation(&request);
+                },
+                MessageType::CoordinatorCommit => {
+                    debug!("participant::protocol -> {}::Received CoordinatorCommit from Coordinator #{}", self.id_str.clone(), request.txid);
+                    self.unknown_ops -= 1;
+                    self.successful_ops += 1;
+                    self.log.append_message(request);
+                },
+                MessageType::CoordinatorAbort => {
+                    debug!("participant::protocol -> {}::Received CoordinatorAbort from Coordinator", self.id_str.clone());
+                    self.unknown_ops -= 1;
+                    self.failed_ops += 1;
+                    self.log.append_message(request);
+                },
+                MessageType::CoordinatorExit => {
+                    debug!("participant::protocol -> {}::Received Exit Signal from Coordinator", self.id_str.clone());
+                    break;
+                },
+                _ => {
+                    warn!("participant::protocol -> {}::Unexpected message type received: {:?}", self.id_str.clone(), request.mtype);
+                    unreachable!()
+                },
+            };
+        }
 
         self.wait_for_exit_signal();
         self.report_status();

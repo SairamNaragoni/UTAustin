@@ -86,6 +86,10 @@ impl OpLog {
         log.insert(id, pm);
     }
 
+    pub fn append_message(&mut self, t: message::ProtocolMessage) {
+        self.append(t.mtype, t.txid, t.senderid, t.opid);
+    }
+
     ///
     /// read(offset)
     ///

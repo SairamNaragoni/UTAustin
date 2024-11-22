@@ -34,16 +34,22 @@ use message::ProtocolMessage;
 ///
 /// HINT: You can change the signature of the function if necessary
 ///
-fn spawn_child_and_connect(child_opts: &mut tpcoptions::TPCOptions) -> (Child, Sender<ProtocolMessage>, Receiver<ProtocolMessage>) {
+fn spawn_child_and_connect(child_opts: &mut tpcoptions::TPCOptions, child_tx:Sender<ProtocolMessage>, child_rx:Receiver<ProtocolMessage>) -> Result<Child, std::io::Error> {
+    let (server, server_name) = IpcOneShotServer::<Sender<(Sender<ProtocolMessage>, Receiver<ProtocolMessage>)>>::new().unwrap();
+    child_opts.ipc_path = server_name;
+
     let child = Command::new(env::current_exe().unwrap())
         .args(child_opts.as_vec())
-        .spawn()
-        .expect("Failed to execute child process");
+        .spawn();
 
-    let (tx, rx) = channel().unwrap();
-    // TODO
+    let child = match child {
+        Ok(c) => c,
+        Err(e) => return Err(e),
+    };
 
-    (child, tx, rx)
+    let (_, tx_rx_sender) = server.accept().unwrap();
+    tx_rx_sender.send((child_tx, child_rx)).unwrap();
+    Ok(child)
 }
 
 ///
@@ -58,11 +64,14 @@ fn spawn_child_and_connect(child_opts: &mut tpcoptions::TPCOptions) -> (Child, S
 /// HINT: You can change the signature of the function if necessasry
 ///
 fn connect_to_coordinator(opts: &tpcoptions::TPCOptions) -> (Sender<ProtocolMessage>, Receiver<ProtocolMessage>) {
-    let (tx, rx) = channel().unwrap();
+    let socket = opts.ipc_path.clone();
+    let sender = Sender::connect(socket).unwrap();
+    let (tx_rx_sender, tx_rx_receiver) = channel().unwrap();
 
-    // TODO
+    sender.send(tx_rx_sender).unwrap();
+    let (child_tx, child_rx) = tx_rx_receiver.recv().unwrap();
 
-    (tx, rx)
+    (child_tx, child_rx)
 }
 
 ///
@@ -82,7 +91,46 @@ fn connect_to_coordinator(opts: &tpcoptions::TPCOptions) -> (Sender<ProtocolMess
 fn run(opts: & tpcoptions::TPCOptions, running: Arc<AtomicBool>) {
     let coord_log_path = format!("{}//{}", opts.log_path, "coordinator.log");
 
-    // TODO
+    let mut coord = coordinator::Coordinator::new(coord_log_path, &running);
+
+    for participant_id in 0..opts.num_participants {
+        let participant_name = format!("participant_{}", participant_id);
+        let mut participant_opts = opts.clone();
+        participant_opts.mode = String::from("participant");
+        participant_opts.num = participant_id;
+        let (participant_tx, participant_rx) = coord.participant_join(&participant_name);
+        match spawn_child_and_connect(&mut participant_opts, participant_tx, participant_rx) {
+            Ok(child) => {
+                info!("spawned participant process with PID={}, name={}", child.id(), participant_name);
+            }
+            Err(e) => {
+                // Handle the error, remove participant from the coordinator
+                info!("failed to spawn participant {}: {:?}", participant_name, e);
+                coord.participant_leave(&participant_name);
+            }
+        }
+    }
+
+    for client_id in 0..opts.num_clients {
+        let client_name: String = format!("client_{}", client_id);
+        let mut client_opts = opts.clone();
+        client_opts.mode = String::from("client");
+        client_opts.num = client_id;
+        let (client_tx, client_rx) = coord.client_join(&client_name);
+        match spawn_child_and_connect(&mut client_opts, client_tx, client_rx) {
+            Ok(child) => {
+                info!("spawned client process with PID={}, name={}", child.id(), client_name);
+            }
+            Err(e) => {
+                // Handle the error, remove client from the coordinator
+                info!("failed to spawn participant {}: {:?}", client_name, e);
+                coord.client_leave(&client_name);
+            }
+        }
+    }
+
+    coord.protocol();
+
 }
 
 ///
@@ -96,7 +144,11 @@ fn run(opts: & tpcoptions::TPCOptions, running: Arc<AtomicBool>) {
 /// 3. Starts the client protocol
 ///
 fn run_client(opts: & tpcoptions::TPCOptions, running: Arc<AtomicBool>) {
-    // TODO
+    let (client_tx, client_rx) = connect_to_coordinator(opts);
+    let client_name: String = format!("client_{}", opts.num);
+
+    let mut client = client::Client::new(client_name, running, client_tx, client_rx);
+    client.protocol(opts.num_requests);
 }
 
 ///
@@ -110,10 +162,19 @@ fn run_client(opts: & tpcoptions::TPCOptions, running: Arc<AtomicBool>) {
 /// 3. Starts the participant protocol
 ///
 fn run_participant(opts: & tpcoptions::TPCOptions, running: Arc<AtomicBool>) {
-    let participant_id_str = format!("participant_{}", opts.num);
-    let participant_log_path = format!("{}//{}.log", opts.log_path, participant_id_str);
-
-    // TODO
+    let participant_name = format!("participant_{}", opts.num);
+    let participant_log_path = format!("{}//{}.log", opts.log_path, participant_name);
+    let (participant_tx, participant_rx) = connect_to_coordinator(opts);
+    let mut participant = participant::Participant::new(
+        participant_name,
+        participant_log_path,
+        running,
+        opts.send_success_probability,
+        opts.operation_success_probability,
+        participant_tx,
+        participant_rx,
+    );
+    participant.protocol();
 }
 
 fn main() {
