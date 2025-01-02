@@ -1,3 +1,3 @@
-module ASSIGN3
+module BST_opt
 
 go 1.23.2

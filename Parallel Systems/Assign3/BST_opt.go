@@ -1,7 +1,7 @@
 package main
 
 import (
-	"ASSIGN3/src/bst"
+	"BST_opt/bst"
 	"flag"
 	"fmt"
 	"time"
